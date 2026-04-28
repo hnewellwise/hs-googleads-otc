@@ -80,14 +80,13 @@ function formatForGoogleAds() {
 
     var hashedEmail = email ? hashEmail(email) : "";
 
-    // Revenue only applies to confirmed (customer) rows
+    // Currency is always written as a valid ISO 4217 code — Google rejects empty strings
     var conversionValue = "";
-    var conversionCurrency = "";
+    var conversionCurrency = TRANSFORM_CONFIG.CURRENCY;
     if (stage === "customer") {
       var revenue = parseFloat(row[RAW_COLS.REVENUE]);
       if (!isNaN(revenue) && revenue > 0) {
         conversionValue = revenue;
-        conversionCurrency = TRANSFORM_CONFIG.CURRENCY;
       }
     }
 

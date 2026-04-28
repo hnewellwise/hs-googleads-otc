@@ -216,13 +216,13 @@ async function formatForGoogleAds(sheetsClient) {
 
     const hashedEmail = email ? hashEmail(email) : "";
 
+    // Currency is always written as a valid ISO 4217 code — Google rejects empty strings
     let conversionValue = "";
-    let conversionCurrency = "";
+    let conversionCurrency = CONFIG.CURRENCY;
     if (stage === "customer") {
       const revenue = parseFloat(row[COL.REVENUE]);
       if (!isNaN(revenue) && revenue > 0) {
         conversionValue = revenue;
-        conversionCurrency = CONFIG.CURRENCY;
       }
     }
 
