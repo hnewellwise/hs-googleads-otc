@@ -1,6 +1,8 @@
 # HubSpot → Google Ads Offline Conversion Tracking
 
-Google Apps Script that pulls contact data from HubSpot and formats it for Google Ads offline conversion import via Data Manager (Google Sheets connection).
+Pulls contact data from HubSpot and formats it for Google Ads offline conversion import via Data Manager (Google Sheets connection).
+
+Originally built as a Google Apps Script running on a time-based trigger. Migrated to GitHub Actions for more reliable scheduling, better error visibility, and easier version control. The Apps Script files remain in `/appscript` as a working backup.
 
 ## What it does
 
@@ -9,7 +11,7 @@ Google Apps Script that pulls contact data from HubSpot and formats it for Googl
 - Hashes email addresses using SHA-256 in line with Google's enhanced conversions requirements
 - Formats data into the correct Google Ads Data Manager template
 - Passes `total_revenue` as the conversion value for Confirmed contacts
-- Logs each execution to a sheet tab and sends an email alert on failure
+- Logs each execution to a Google Sheet tab and sends an email alert on failure
 
 ## Sheet structure
 
@@ -26,61 +28,90 @@ Google Apps Script that pulls contact data from HubSpot and formats it for Googl
 | `opportunity` | Hubspot Contacts - Opportunity |
 | `customer` | Hubspot Contacts - Confirmed |
 
-## Setup
+---
 
-### 1. HubSpot private app
+## Primary: GitHub Actions
+
+The main version runs as a Node.js script via GitHub Actions (`src/index.mjs`), triggered daily at 1:00 AM UTC. It can also be triggered manually from the Actions tab.
+
+### Setup
+
+#### 1. HubSpot private app
 
 1. In HubSpot: Settings > Integrations > Private Apps > Create private app
 2. Grant scope: `crm.objects.contacts.read`
 3. Copy the token
 
-### 2. Apps Script
+#### 2. Google service account
 
-1. Open your Google Sheet > Extensions > Apps Script
-2. Create three script files and paste the contents of each:
-   - `Step1_HubSpot_Fetch.js`
-   - `Step2_Transform_GoogleAds.js`
-   - `Step3_Chain.js`
+1. Create a service account in Google Cloud Console with access to the Google Sheet
+2. Download the JSON key file
+3. Share the Google Sheet with the service account email
 
-### 3. Script Properties
+#### 3. GitHub Secrets
 
-In Apps Script > Project Settings > Script Properties, add the following:
+In the repo: Settings → Secrets and variables → Actions → New repository secret
+
+| Secret | Value |
+|--------|-------|
+| `HUBSPOT_API_KEY` | HubSpot private app token |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Full contents of the service account JSON key file |
+| `SPREADSHEET_ID` | Google Sheet ID (from the sheet URL) |
+| `ALERT_EMAIL` | Email address to notify on failure |
+| `GMAIL_USER` | Gmail address used to send alerts |
+| `GMAIL_APP_PASSWORD` | Gmail app password (not your login password) |
+
+No credentials or personal data should ever be hardcoded in the script files.
+
+#### 4. Initial backfill (optional)
+
+In `src/index.mjs`, set `BACKFILL_MODE: true` and trigger the workflow manually. Set it back to `false` afterwards.
+
+#### 5. Google Ads Data Manager
+
+1. In Google Ads: Tools → Data Manager → + New data source → Google Sheets
+2. Connect to the `GOOGLE_ADS_UPLOAD` tab
+3. Map columns to the correct conversion fields
+4. Set refresh schedule to daily
+
+---
+
+## Backup: Google Apps Script
+
+The original Apps Script implementation is in `/appscript`. It is fully functional and can be used as a fallback if needed.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `Step1_HubSpot_Fetch.js` | Pulls contacts from HubSpot, writes to `RAW_HUBSPOT` tab |
+| `Step2_Transform_GoogleAds.js` | Transforms raw data, writes to `GOOGLE_ADS_UPLOAD` tab |
+| `Step3_Chain.js` | Chains steps 1 and 2, handles error alerting and execution logging |
+
+### Setup
+
+1. Open your Google Sheet → Extensions → Apps Script
+2. Create three script files and paste the contents of each from `/appscript`
+3. In Apps Script → Project Settings → Script Properties, add:
 
 | Key | Value |
 |-----|-------|
 | `HUBSPOT_API_KEY` | Your HubSpot private app token |
 | `ALERT_EMAIL` | Email address to notify on script failure |
 
-No credentials or personal data should ever be hardcoded in the script files.
+4. Set a time-based trigger pointing at `dailyRun` (Apps Script editor → Triggers → Add Trigger)
 
-### 4. Initial backfill (optional)
-
-In `Step1_HubSpot_Fetch.js`, set `BACKFILL_MODE: true` and run `dailyRun()` once to populate historical data. Then set it back to `false`.
-
-### 5. Daily trigger
-
-Apps Script editor > Triggers (clock icon, left sidebar) > Add Trigger:
-- Function: `dailyRun`
-- Event source: Time-driven
-- Type: Day timer
-- Time: 1am–2am (or your preferred time)
-
-### 6. Google Ads Data Manager
-
-1. In Google Ads: Tools > Data Manager > + New data source > Google Sheets
-2. Connect to the `GOOGLE_ADS_UPLOAD` tab
-3. Map columns to the correct conversion fields
-4. Set refresh schedule to daily
+---
 
 ## Configuration
 
-All configurable values are at the top of each file in the `CONFIG` / `TRANSFORM_CONFIG` blocks.
+All configurable values are at the top of `src/index.mjs` in the `CONFIG` block.
 
-| Setting | File | Default | Description |
-|---------|------|---------|-------------|
-| `LOOKBACK_DAYS` | Step 1 | `90` | Lookback window for lastmodifieddate filter |
-| `BACKFILL_MODE` | Step 1 | `false` | Set to `true` for a one-off full historical pull |
-| `CURRENCY` | Step 2 | `USD` | Conversion currency for Confirmed rows |
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `LOOKBACK_DAYS` | `90` | Lookback window for lastmodifieddate filter |
+| `BACKFILL_MODE` | `false` | Set to `true` for a one-off full historical pull |
+| `CURRENCY` | `USD` | Conversion currency for Confirmed rows |
 
 ## Notes
 

@@ -440,10 +440,10 @@ function hashEmail(email) {
 }
 
 function formatDateForGoogleAds(date) {
-  // Format: yyyy-MM-dd HH:mm:ss+0000
+  // Format: yyyy-MM-dd HH:mm:ss+00:00
   return date.toISOString()
     .replace("T", " ")
-    .replace(/\.\d{3}Z$/, "+0000");
+    .replace(/\.\d{3}Z$/, "+00:00");
 }
 
 
