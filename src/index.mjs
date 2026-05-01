@@ -22,12 +22,8 @@ const CONFIG = {
   // Cast a wide net — stage dates are not server-side filterable.
   LOOKBACK_DAYS: 90,
 
-  // How far back to include contacts in the Google Ads upload sheet (by stage date).
-  // Only contacts who entered their stage within this window get uploaded.
-  // A 7-day buffer gives cover if the workflow misses a day or two.
-  UPLOAD_LOOKBACK_DAYS: 7,
-
-  // Set to true for a one-off full historical pull. Bypasses the upload window filter.
+  // Set to true for a one-off full historical pull.
+  // Clears the tracking sheet and re-uploads everything.
   BACKFILL_MODE: false,
 
   HUBSPOT_API_BASE: "https://api.hubapi.com",
@@ -38,14 +34,14 @@ const CONFIG = {
     "hs_google_click_id",
     "lifecyclestage",
     "createdate",
-    "hs_lifecyclestage_opportunity_date",
-    "hs_lifecyclestage_customer_date",
+    "lastmodifieddate",
     "total_revenue"
   ],
 
   SHEETS: {
     RAW: "RAW_HUBSPOT",
     UPLOAD: "GOOGLE_ADS_UPLOAD",
+    TRACKING: "UPLOADED_CONTACTS",
     LOG: "EXECUTION_LOG"
   },
 
@@ -84,10 +80,12 @@ async function main() {
     console.error(errors[errors.length - 1]);
   }
 
-  // Step 2: Filter to new stage transitions, write upload sheet
+  // Step 2: Compare against tracking sheet, upload only new stage transitions
   if (errors.length === 0) {
     try {
-      uploadRowCount = await formatForGoogleAds(sheetsClient, contacts);
+      const alreadyUploaded = await loadTrackingSheet(sheetsClient);
+      console.log(`Tracking sheet loaded. Previously uploaded: ${alreadyUploaded.size}`);
+      uploadRowCount = await formatForGoogleAds(sheetsClient, contacts, alreadyUploaded);
       console.log(`Step 2 complete. Upload rows: ${uploadRowCount}`);
     } catch (e) {
       errors.push(`Step 2 (Google Ads transform) failed: ${e.message}`);
@@ -179,21 +177,15 @@ async function searchContacts(token, stage, cutoffMs) {
 
 
 // ============================================================
-// STEP 2: FILTER + TRANSFORM → GOOGLE ADS UPLOAD SHEET
+// STEP 2: COMPARE + TRANSFORM → GOOGLE ADS UPLOAD SHEET
 // Operates on in-memory contacts — no sheet read required.
-// Only contacts who entered their stage within UPLOAD_LOOKBACK_DAYS
-// are written to the upload sheet. Older contacts stay in RAW only.
+// Only contact+stage combinations not present in the tracking sheet
+// are written to the upload sheet. Appends new entries to tracking.
 // ============================================================
-async function formatForGoogleAds(sheetsClient, contacts) {
-  const uploadCutoffMs = CONFIG.BACKFILL_MODE
-    ? 0
-    : Date.now() - CONFIG.UPLOAD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-
-  if (!CONFIG.BACKFILL_MODE) {
-    console.log(`Upload cutoff (stage date): ${new Date(uploadCutoffMs).toISOString()}`);
-  }
-
+async function formatForGoogleAds(sheetsClient, contacts, alreadyUploaded) {
   const outputRows = [];
+  const newTrackingRows = [];
+  const runTimestamp = formatDateForGoogleAds(new Date());
   let skipped = 0;
 
   for (const contact of contacts) {
@@ -208,14 +200,20 @@ async function formatForGoogleAds(sheetsClient, contacts) {
 
     if (!email && !gclid) { skipped++; continue; }
 
-    // Use the stage-specific transition date as conversion time
-    const stageDate = getStageDateForContact(contact);
-    if (!stageDate) { skipped++; continue; }
-    if (stageDate.getTime() < uploadCutoffMs) { skipped++; continue; }
+    // Skip if this contact+stage has already been uploaded
+    const trackingKey = `${contact.id}|${stage}`;
+    if (!CONFIG.BACKFILL_MODE && alreadyUploaded.has(trackingKey)) {
+      skipped++;
+      continue;
+    }
+
+    // Use lastmodifieddate as conversion time — best available proxy
+    // since hs_lifecyclestage_*_date is not reliably populated in HubSpot
+    const lastModified = p.lastmodifieddate ? new Date(p.lastmodifieddate) : new Date();
+    const conversionTime = formatDateForGoogleAds(lastModified);
 
     const hashedEmail = email ? hashEmail(email) : "";
     const hashedPhone = p.phone ? hashPhone(p.phone) : "";
-    const conversionTime = formatDateForGoogleAds(stageDate);
 
     let conversionValue = "";
     if (stage === "customer") {
@@ -234,6 +232,8 @@ async function formatForGoogleAds(sheetsClient, contacts) {
       CONFIG.CURRENCY,
       conversionValue
     ]);
+
+    newTrackingRows.push([contact.id, stage, conversionTime, runTimestamp]);
   }
 
   console.log(`Upload rows: ${outputRows.length} | Skipped: ${skipped}`);
@@ -250,6 +250,11 @@ async function formatForGoogleAds(sheetsClient, contacts) {
 
   await clearAndWriteSheet(sheetsClient, CONFIG.SHEETS.UPLOAD, [headers, ...outputRows]);
   console.log(`Wrote ${outputRows.length} rows to ${CONFIG.SHEETS.UPLOAD}`);
+
+  if (newTrackingRows.length > 0) {
+    await appendToTrackingSheet(sheetsClient, newTrackingRows);
+    console.log(`Tracking sheet updated with ${newTrackingRows.length} new entries.`);
+  }
 
   return outputRows.length;
 }
@@ -268,14 +273,12 @@ async function writeRawData(sheetsClient, contacts) {
     "GCLID",
     "Lifecycle Stage",
     "Contact Create Date",
-    "Stage Date (Raw)",
-    "Stage Date (Formatted)",
+    "Last Modified Date",
     "Total Revenue"
   ];
 
   const rows = contacts.map(contact => {
     const p = contact.properties;
-    const stageDate = getStageDateForContact(contact);
 
     return [
       contact.id,
@@ -284,8 +287,7 @@ async function writeRawData(sheetsClient, contacts) {
       p.hs_google_click_id || "",
       p.lifecyclestage || "",
       p.createdate || "",
-      stageDate ? stageDate.toISOString() : "",
-      stageDate ? formatDateForGoogleAds(stageDate) : "",
+      p.lastmodifieddate || "",
       p.total_revenue || ""
     ];
   });
@@ -363,6 +365,59 @@ async function clearAndWriteSheet(sheetsClient, sheetName, rows) {
 
 
 // ============================================================
+// TRACKING SHEET
+// Append-only log of every contact+stage combination uploaded.
+// Key: contactId|stage — prevents re-uploads on subsequent runs.
+// ============================================================
+async function loadTrackingSheet(sheetsClient) {
+  const uploaded = new Set();
+
+  const result = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId: CONFIG.SPREADSHEET_ID,
+    range: `${CONFIG.SHEETS.TRACKING}!A:B`
+  }).catch(() => null);
+
+  const rows = result?.data.values || [];
+
+  // Skip header row, build set of contactId|stage keys
+  for (const row of rows.slice(1)) {
+    if (row[0] && row[1]) {
+      uploaded.add(`${row[0]}|${row[1]}`);
+    }
+  }
+
+  return uploaded;
+}
+
+
+async function appendToTrackingSheet(sheetsClient, newRows) {
+  // Ensure header exists
+  const existing = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId: CONFIG.SPREADSHEET_ID,
+    range: `${CONFIG.SHEETS.TRACKING}!A1:D1`
+  }).catch(() => null);
+
+  if (!existing?.data.values?.length) {
+    await sheetsClient.spreadsheets.values.update({
+      spreadsheetId: CONFIG.SPREADSHEET_ID,
+      range: `${CONFIG.SHEETS.TRACKING}!A1`,
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [["Contact ID", "Stage", "Conversion Time", "First Uploaded (UTC)"]]
+      }
+    });
+  }
+
+  await sheetsClient.spreadsheets.values.append({
+    spreadsheetId: CONFIG.SPREADSHEET_ID,
+    range: `${CONFIG.SHEETS.TRACKING}!A:D`,
+    valueInputOption: "RAW",
+    requestBody: { values: newRows }
+  });
+}
+
+
+// ============================================================
 // ERROR ALERT
 // ============================================================
 async function sendErrorAlert(errors, startTime) {
@@ -404,15 +459,6 @@ async function sendErrorAlert(errors, startTime) {
 // ============================================================
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function getStageDateForContact(contact) {
-  const p = contact.properties;
-  const stage = (p.lifecyclestage || "").toLowerCase();
-  const raw = stage === "customer"
-    ? p.hs_lifecyclestage_customer_date
-    : p.hs_lifecyclestage_opportunity_date;
-  return raw ? new Date(raw) : null;
 }
 
 async function hubspotPost(url, token, payload, retries = 4) {

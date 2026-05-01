@@ -29,8 +29,7 @@ var CONFIG = {
     "hs_google_click_id",
     "lifecyclestage",
     "createdate",
-    "hs_lifecyclestage_opportunity_date",
-    "hs_lifecyclestage_customer_date",
+    "lastmodifieddate",
     "total_revenue"
   ]
 };
@@ -137,25 +136,20 @@ function writeRawData(contacts) {
   sheet.clearContents();
 
   var headers = [
-    "Contact ID",             // 0
-    "Email",                  // 1
-    "Phone",                  // 2
-    "GCLID",                  // 3
-    "Lifecycle Stage",        // 4
-    "Contact Create Date",    // 5
-    "Stage Date (Raw)",       // 6
-    "Stage Date (Formatted)", // 7
-    "Total Revenue"           // 8
+    "Contact ID",          // 0
+    "Email",               // 1
+    "Phone",               // 2
+    "GCLID",               // 3
+    "Lifecycle Stage",     // 4
+    "Contact Create Date", // 5
+    "Last Modified Date",  // 6
+    "Total Revenue"        // 7
   ];
 
   var rows = [headers];
 
   for (var i = 0; i < contacts.length; i++) {
     var p = contacts[i].properties;
-    var stageDate = getStageDateForContact(contacts[i]);
-    var stageDateFormatted = stageDate
-      ? Utilities.formatDate(stageDate, "UTC", "yyyy-MM-dd HH:mm:ss") + "+00:00"
-      : "";
 
     rows.push([
       contacts[i].id,
@@ -164,8 +158,7 @@ function writeRawData(contacts) {
       p.hs_google_click_id || "",
       p.lifecyclestage || "",
       p.createdate || "",
-      stageDate ? stageDate.toISOString() : "",
-      stageDateFormatted,
+      p.lastmodifieddate || "",
       p.total_revenue || ""
     ]);
   }
@@ -180,15 +173,6 @@ function writeRawData(contacts) {
 // ============================================================
 // HELPERS
 // ============================================================
-function getStageDateForContact(contact) {
-  var p = contact.properties;
-  var stage = (p.lifecyclestage || "").toLowerCase();
-  var raw = stage === "customer"
-    ? p.hs_lifecyclestage_customer_date
-    : p.hs_lifecyclestage_opportunity_date;
-  return raw ? new Date(raw) : null;
-}
-
 function hubspotPost(url, token, payload) {
   var options = {
     method: "post",

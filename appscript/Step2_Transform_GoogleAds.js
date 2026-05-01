@@ -1,9 +1,9 @@
 // ============================================================
 // STEP 2: Transform RAW_HUBSPOT → GOOGLE_ADS_UPLOAD tab
 // ============================================================
-// Reads from RAW_HUBSPOT, filters to contacts who entered their
-// stage within the last UPLOAD_LOOKBACK_DAYS, hashes email via
-// SHA-256, and writes to GOOGLE_ADS_UPLOAD tab.
+// Reads from RAW_HUBSPOT, compares against UPLOADED_CONTACTS
+// tracking sheet, and only writes new contact+stage combinations
+// to GOOGLE_ADS_UPLOAD. Appends new entries to tracking sheet.
 //
 // Conversion actions:
 //   opportunity → Hubspot Contacts - Opportunity (no value)
@@ -13,11 +13,9 @@
 var TRANSFORM_CONFIG = {
   RAW_SHEET_NAME: "RAW_HUBSPOT",
   OUTPUT_SHEET_NAME: "GOOGLE_ADS_UPLOAD",
+  TRACKING_SHEET_NAME: "UPLOADED_CONTACTS",
 
-  // Only contacts who entered their stage within this window are uploaded.
-  // Set to 0 (or match BACKFILL_MODE) to bypass for a full historical upload.
-  UPLOAD_LOOKBACK_DAYS: 7,
-
+  // Set to true for a one-off full historical upload. Bypasses tracking filter.
   BACKFILL_MODE: false,
 
   CONVERSION_MAP: {
@@ -31,15 +29,14 @@ var TRANSFORM_CONFIG = {
 
 // Column indices in RAW_HUBSPOT (0-based, matching Step 1 output)
 var RAW_COLS = {
-  CONTACT_ID:   0,
-  EMAIL:        1,
-  PHONE:        2,
-  GCLID:        3,
-  STAGE:        4,
-  CREATE_DATE:  5,
-  STAGE_RAW:    6,
-  STAGE_FMT:    7,
-  REVENUE:      8
+  CONTACT_ID:    0,
+  EMAIL:         1,
+  PHONE:         2,
+  GCLID:         3,
+  STAGE:         4,
+  CREATE_DATE:   5,
+  LAST_MODIFIED: 6,
+  REVENUE:       7
 };
 
 
@@ -61,18 +58,15 @@ function formatForGoogleAds() {
     return;
   }
 
-  var uploadCutoffMs = TRANSFORM_CONFIG.BACKFILL_MODE
-    ? 0
-    : Date.now() - (TRANSFORM_CONFIG.UPLOAD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+  var alreadyUploaded = loadTrackingSheet(ss);
+  Logger.log("Tracking sheet loaded. Previously uploaded: " + alreadyUploaded.size);
 
-  if (!TRANSFORM_CONFIG.BACKFILL_MODE) {
-    Logger.log("Upload cutoff (stage date): " + new Date(uploadCutoffMs).toISOString());
-  }
-
+  var runTimestamp = Utilities.formatDate(new Date(), "UTC", "yyyy-MM-dd HH:mm:ss") + "+00:00";
   var rows = data.slice(1);
   Logger.log("Rows to process: " + rows.length);
 
   var outputRows = [];
+  var newTrackingRows = [];
   var skipped = 0;
 
   for (var i = 0; i < rows.length; i++) {
@@ -87,15 +81,26 @@ function formatForGoogleAds() {
 
     if (!email && !gclid) { skipped++; continue; }
 
-    // Filter by stage date — skip if no date or outside upload window
-    var stageDateRaw = row[RAW_COLS.STAGE_RAW] || "";
-    if (!stageDateRaw) { skipped++; continue; }
+    // Skip if this contact+stage has already been uploaded
+    var contactId = String(row[RAW_COLS.CONTACT_ID] || "");
+    var trackingKey = contactId + "|" + stage;
 
-    var stageDateMs = new Date(stageDateRaw).getTime();
-    if (isNaN(stageDateMs)) { skipped++; continue; }
-    if (stageDateMs < uploadCutoffMs) { skipped++; continue; }
+    if (!TRANSFORM_CONFIG.BACKFILL_MODE && alreadyUploaded.has(trackingKey)) {
+      skipped++;
+      continue;
+    }
 
-    var conversionTime = row[RAW_COLS.STAGE_FMT] || "";
+    // Use lastmodifieddate as conversion time — best available proxy
+    // since hs_lifecyclestage_*_date is not reliably populated in HubSpot
+    var lastModifiedRaw = row[RAW_COLS.LAST_MODIFIED] || "";
+    var conversionTime = "";
+    if (lastModifiedRaw) {
+      var lastModifiedDate = new Date(lastModifiedRaw);
+      conversionTime = Utilities.formatDate(lastModifiedDate, "UTC", "yyyy-MM-dd HH:mm:ss") + "+00:00";
+    } else {
+      conversionTime = runTimestamp;
+    }
+
     var hashedEmail = email ? hashEmail(email) : "";
     var hashedPhone = row[RAW_COLS.PHONE] ? hashPhone(String(row[RAW_COLS.PHONE])) : "";
 
@@ -117,11 +122,53 @@ function formatForGoogleAds() {
       TRANSFORM_CONFIG.CURRENCY,
       conversionValue
     ]);
+
+    newTrackingRows.push([contactId, stage, conversionTime, runTimestamp]);
   }
 
   Logger.log("Upload rows: " + outputRows.length + " | Skipped: " + skipped);
   writeOutputSheet(ss, outputRows);
+
+  if (newTrackingRows.length > 0) {
+    appendToTrackingSheet(ss, newTrackingRows);
+    Logger.log("Tracking sheet updated with " + newTrackingRows.length + " new entries.");
+  }
+
   Logger.log("GOOGLE_ADS_UPLOAD tab updated successfully.");
+}
+
+
+// ============================================================
+// TRACKING SHEET
+// Append-only log of every contact+stage combination uploaded.
+// Key: contactId|stage — prevents re-uploads on subsequent runs.
+// ============================================================
+function loadTrackingSheet(ss) {
+  var uploaded = new Set ? new Set() : { _data: {}, has: function(k) { return !!this._data[k]; }, add: function(k) { this._data[k] = true; }, get size() { return Object.keys(this._data).length; } };
+  var sheet = ss.getSheetByName(TRANSFORM_CONFIG.TRACKING_SHEET_NAME);
+
+  if (!sheet || sheet.getLastRow() <= 1) return uploaded;
+
+  var rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i][0] && rows[i][1]) {
+      uploaded.add(rows[i][0] + "|" + rows[i][1]);
+    }
+  }
+
+  return uploaded;
+}
+
+function appendToTrackingSheet(ss, newRows) {
+  var sheet = ss.getSheetByName(TRANSFORM_CONFIG.TRACKING_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(TRANSFORM_CONFIG.TRACKING_SHEET_NAME);
+    sheet.getRange(1, 1, 1, 4).setValues([["Contact ID", "Stage", "Conversion Time", "First Uploaded (UTC)"]]);
+    sheet.getRange(1, 1, 1, 4).setFontWeight("bold");
+  }
+
+  sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, newRows[0].length).setValues(newRows);
 }
 
 
