@@ -3,10 +3,10 @@
 // Node.js version — runs via GitHub Actions
 // ============================================================
 // Required environment variables (set as GitHub Secrets):
-//   HUBSPOT_API_KEY           — HubSpot private app token
+//   HUBSPOT_API_KEY             — HubSpot private app token
 //   GOOGLE_SERVICE_ACCOUNT_JSON — Full JSON key for service account
-//   SPREADSHEET_ID            — Google Sheet ID
-//   ALERT_EMAIL               — Email to notify on failure
+//   SPREADSHEET_ID              — Google Sheet ID
+//   ALERT_EMAIL                 — Email to notify on failure
 // ============================================================
 
 import fetch from "node-fetch";
@@ -18,20 +18,30 @@ import nodemailer from "nodemailer";
 // CONFIG
 // ============================================================
 const CONFIG = {
+  // How far back to fetch contacts from HubSpot (by lastmodifieddate).
+  // Cast a wide net — stage dates are not server-side filterable.
   LOOKBACK_DAYS: 90,
+
+  // How far back to include contacts in the Google Ads upload sheet (by stage date).
+  // Only contacts who entered their stage within this window get uploaded.
+  // A 7-day buffer gives cover if the workflow misses a day or two.
+  UPLOAD_LOOKBACK_DAYS: 7,
+
+  // Set to true for a one-off full historical pull. Bypasses the upload window filter.
   BACKFILL_MODE: false,
 
   HUBSPOT_API_BASE: "https://api.hubapi.com",
 
   CONTACT_PROPERTIES: [
     "email",
+    "phone",
     "hs_google_click_id",
     "lifecyclestage",
     "createdate",
+    "hs_lifecyclestage_opportunity_date",
+    "hs_lifecyclestage_customer_date",
     "total_revenue"
   ],
-
-  INCLUDED_STAGES: ["opportunity", "customer"],
 
   SHEETS: {
     RAW: "RAW_HUBSPOT",
@@ -61,10 +71,11 @@ async function main() {
   console.log(`dailyRun started at: ${startTime.toISOString()}`);
 
   const sheetsClient = await getSheetsClient();
+  let contacts = [];
 
-  // Step 1: Fetch from HubSpot
+  // Step 1: Fetch from HubSpot, write full set to RAW sheet
   try {
-    const contacts = await fetchContacts();
+    contacts = await fetchContacts();
     rawRowCount = contacts.length;
     console.log(`Step 1 complete. Contacts fetched: ${rawRowCount}`);
     await writeRawData(sheetsClient, contacts);
@@ -73,10 +84,10 @@ async function main() {
     console.error(errors[errors.length - 1]);
   }
 
-  // Step 2: Transform + write Google Ads upload sheet
+  // Step 2: Filter to new stage transitions, write upload sheet
   if (errors.length === 0) {
     try {
-      uploadRowCount = await formatForGoogleAds(sheetsClient);
+      uploadRowCount = await formatForGoogleAds(sheetsClient, contacts);
       console.log(`Step 2 complete. Upload rows: ${uploadRowCount}`);
     } catch (e) {
       errors.push(`Step 2 (Google Ads transform) failed: ${e.message}`);
@@ -86,7 +97,6 @@ async function main() {
     console.log("Skipping Step 2 — Step 1 failed.");
   }
 
-  // Write execution log
   const status = errors.length > 0 ? "FAILED" : "OK";
   await writeExecutionLog(sheetsClient, startTime, status, rawRowCount, uploadRowCount, errors);
 
@@ -113,15 +123,15 @@ async function fetchContacts() {
   if (CONFIG.BACKFILL_MODE) {
     console.log("BACKFILL_MODE enabled — fetching all opportunity and customer contacts.");
   } else {
-    console.log(`Cutoff date: ${new Date(cutoffMs).toISOString()}`);
+    console.log(`Fetch cutoff (lastmodifieddate): ${new Date(cutoffMs).toISOString()}`);
   }
 
-  const opportunities = await searchContacts(token, "opportunity", cutoffMs);
-  console.log(`Opportunities found: ${opportunities.length}`);
+  const [opportunities, confirmed] = await Promise.all([
+    searchContacts(token, "opportunity", cutoffMs),
+    searchContacts(token, "customer", cutoffMs)
+  ]);
 
-  const confirmed = await searchContacts(token, "customer", cutoffMs);
-  console.log(`Confirmed found: ${confirmed.length}`);
-
+  console.log(`Opportunities: ${opportunities.length} | Confirmed: ${confirmed.length}`);
   return [...opportunities, ...confirmed];
 }
 
@@ -129,7 +139,6 @@ async function fetchContacts() {
 async function searchContacts(token, stage, cutoffMs) {
   const allContacts = [];
   let after = undefined;
-  let hasMore = true;
 
   const filters = [
     { propertyName: "lifecyclestage", operator: "EQ", value: stage }
@@ -143,7 +152,7 @@ async function searchContacts(token, stage, cutoffMs) {
     });
   }
 
-  while (hasMore) {
+  while (true) {
     const payload = {
       filterGroups: [{ filters }],
       properties: CONFIG.CONTACT_PROPERTIES,
@@ -162,7 +171,7 @@ async function searchContacts(token, stage, cutoffMs) {
     if (response.paging?.next?.after) {
       after = response.paging.next.after;
     } else {
-      hasMore = false;
+      break;
     }
   }
 
@@ -171,56 +180,47 @@ async function searchContacts(token, stage, cutoffMs) {
 
 
 // ============================================================
-// STEP 2: TRANSFORM + WRITE GOOGLE ADS UPLOAD SHEET
+// STEP 2: FILTER + TRANSFORM → GOOGLE ADS UPLOAD SHEET
+// Operates on in-memory contacts — no sheet read required.
+// Only contacts who entered their stage within UPLOAD_LOOKBACK_DAYS
+// are written to the upload sheet. Older contacts stay in RAW only.
 // ============================================================
-async function formatForGoogleAds(sheetsClient) {
-  // Read raw data from sheet
-  const rawData = await sheetsClient.spreadsheets.values.get({
-    spreadsheetId: CONFIG.SPREADSHEET_ID,
-    range: `${CONFIG.SHEETS.RAW}!A:G`
-  });
+async function formatForGoogleAds(sheetsClient, contacts) {
+  const uploadCutoffMs = CONFIG.BACKFILL_MODE
+    ? 0
+    : Date.now() - CONFIG.UPLOAD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
 
-  const rows = rawData.data.values || [];
-  if (rows.length <= 1) {
-    console.log("RAW_HUBSPOT is empty. Nothing to transform.");
-    return 0;
+  if (!CONFIG.BACKFILL_MODE) {
+    console.log(`Upload cutoff (stage date): ${new Date(uploadCutoffMs).toISOString()}`);
   }
 
-  // Skip header row
-  const dataRows = rows.slice(1);
   const outputRows = [];
   let skipped = 0;
 
-  // Column indices matching RAW_HUBSPOT headers
-  const COL = {
-    CONTACT_ID: 0,
-    EMAIL: 1,
-    GCLID: 2,
-    STAGE: 3,
-    CREATE_RAW: 4,
-    CREATE_FMT: 5,
-    REVENUE: 6
-  };
-
-  for (const row of dataRows) {
-    const stage = (row[COL.STAGE] || "").toLowerCase().trim();
+  for (const contact of contacts) {
+    const p = contact.properties;
+    const stage = (p.lifecyclestage || "").toLowerCase().trim();
     const conversionName = CONFIG.CONVERSION_MAP[stage];
 
     if (!conversionName) { skipped++; continue; }
 
-    const email = (row[COL.EMAIL] || "").toLowerCase().trim();
-    const gclid = (row[COL.GCLID] || "").trim();
-    const conversionTime = row[COL.CREATE_FMT] || "";
+    const email = (p.email || "").toLowerCase().trim();
+    const gclid = (p.hs_google_click_id || "").trim();
 
     if (!email && !gclid) { skipped++; continue; }
 
-    const hashedEmail = email ? hashEmail(email) : "";
+    // Use the stage-specific transition date as conversion time
+    const stageDate = getStageDateForContact(contact);
+    if (!stageDate) { skipped++; continue; }
+    if (stageDate.getTime() < uploadCutoffMs) { skipped++; continue; }
 
-    // Currency is always written as a valid ISO 4217 code — Google rejects empty strings
+    const hashedEmail = email ? hashEmail(email) : "";
+    const hashedPhone = p.phone ? hashPhone(p.phone) : "";
+    const conversionTime = formatDateForGoogleAds(stageDate);
+
     let conversionValue = "";
-    let conversionCurrency = CONFIG.CURRENCY;
     if (stage === "customer") {
-      const revenue = parseFloat(row[COL.REVENUE]);
+      const revenue = parseFloat(p.total_revenue);
       if (!isNaN(revenue) && revenue > 0) {
         conversionValue = revenue;
       }
@@ -229,19 +229,20 @@ async function formatForGoogleAds(sheetsClient) {
     outputRows.push([
       gclid,
       hashedEmail,
+      hashedPhone,
       conversionName,
       conversionTime,
-      conversionCurrency,
+      CONFIG.CURRENCY,
       conversionValue
     ]);
   }
 
-  console.log(`Output rows: ${outputRows.length} | Skipped: ${skipped}`);
+  console.log(`Upload rows: ${outputRows.length} | Skipped: ${skipped}`);
 
-  // Write to GOOGLE_ADS_UPLOAD sheet
   const headers = [
     "Google Click ID",
     "Email",
+    "Phone Number",
     "Conversion Name",
     "Conversion Time",
     "Conversion Currency",
@@ -257,32 +258,35 @@ async function formatForGoogleAds(sheetsClient) {
 
 // ============================================================
 // WRITE RAW DATA TO SHEET
+// Full set of fetched contacts — used for auditing.
+// Stage date is stored in place of createdate.
 // ============================================================
 async function writeRawData(sheetsClient, contacts) {
   const headers = [
     "Contact ID",
     "Email",
+    "Phone",
     "GCLID",
     "Lifecycle Stage",
-    "Contact Create Date (Raw)",
-    "Contact Create Date (Formatted)",
+    "Contact Create Date",
+    "Stage Date (Raw)",
+    "Stage Date (Formatted)",
     "Total Revenue"
   ];
 
   const rows = contacts.map(contact => {
     const p = contact.properties;
-    const createDate = p.createdate ? new Date(p.createdate) : null;
-    const createFormatted = createDate
-      ? formatDateForGoogleAds(createDate)
-      : "";
+    const stageDate = getStageDateForContact(contact);
 
     return [
       contact.id,
       p.email || "",
+      p.phone || "",
       p.hs_google_click_id || "",
       p.lifecyclestage || "",
       p.createdate || "",
-      createFormatted,
+      stageDate ? stageDate.toISOString() : "",
+      stageDate ? formatDateForGoogleAds(stageDate) : "",
       p.total_revenue || ""
     ];
   });
@@ -299,14 +303,12 @@ async function writeExecutionLog(sheetsClient, startTime, status, rawRows, uploa
   const timestamp = formatDateForGoogleAds(startTime);
   const errorSummary = errors.length > 0 ? errors.join(" | ") : "";
 
-  // Check if log sheet exists and has headers
   const existingData = await sheetsClient.spreadsheets.values.get({
     spreadsheetId: CONFIG.SPREADSHEET_ID,
     range: `${CONFIG.SHEETS.LOG}!A1:E1`
   }).catch(() => null);
 
-  if (!existingData || !existingData.data.values?.length) {
-    // Write headers first
+  if (!existingData?.data.values?.length) {
     await sheetsClient.spreadsheets.values.update({
       spreadsheetId: CONFIG.SPREADSHEET_ID,
       range: `${CONFIG.SHEETS.LOG}!A1`,
@@ -317,7 +319,6 @@ async function writeExecutionLog(sheetsClient, startTime, status, rawRows, uploa
     });
   }
 
-  // Append log row
   await sheetsClient.spreadsheets.values.append({
     spreadsheetId: CONFIG.SPREADSHEET_ID,
     range: `${CONFIG.SHEETS.LOG}!A:E`,
@@ -338,10 +339,8 @@ async function getSheetsClient() {
   const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!serviceAccountJson) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON not set.");
 
-  const credentials = JSON.parse(serviceAccountJson);
-
   const auth = new google.auth.GoogleAuth({
-    credentials,
+    credentials: JSON.parse(serviceAccountJson),
     scopes: ["https://www.googleapis.com/auth/spreadsheets"]
   });
 
@@ -350,13 +349,11 @@ async function getSheetsClient() {
 
 
 async function clearAndWriteSheet(sheetsClient, sheetName, rows) {
-  // Clear existing content
   await sheetsClient.spreadsheets.values.clear({
     spreadsheetId: CONFIG.SPREADSHEET_ID,
     range: `${sheetName}!A:Z`
   });
 
-  // Write new content
   await sheetsClient.spreadsheets.values.update({
     spreadsheetId: CONFIG.SPREADSHEET_ID,
     range: `${sheetName}!A1`,
@@ -376,8 +373,6 @@ async function sendErrorAlert(errors, startTime) {
     return;
   }
 
-  // GitHub Actions will surface the error in the workflow log
-  // Email via nodemailer using Gmail SMTP if credentials provided
   const gmailUser = process.env.GMAIL_USER;
   const gmailPass = process.env.GMAIL_APP_PASSWORD;
 
@@ -397,16 +392,10 @@ async function sendErrorAlert(errors, startTime) {
     ...errors.map(e => `• ${e}`),
     `\nSpreadsheet: https://docs.google.com/spreadsheets/d/${CONFIG.SPREADSHEET_ID}`,
     `Time: ${startTime.toISOString()}`,
-    "Workflow: https://github.com"
+    "Workflow: https://github.com/hnewellwise/hs-googleads-otc/actions"
   ].join("\n");
 
-  await transporter.sendMail({
-    from: gmailUser,
-    to: alertEmail,
-    subject,
-    text: body
-  });
-
+  await transporter.sendMail({ from: gmailUser, to: alertEmail, subject, text: body });
   console.log(`Error alert sent to ${alertEmail}`);
 }
 
@@ -414,6 +403,15 @@ async function sendErrorAlert(errors, startTime) {
 // ============================================================
 // HELPERS
 // ============================================================
+function getStageDateForContact(contact) {
+  const p = contact.properties;
+  const stage = (p.lifecyclestage || "").toLowerCase();
+  const raw = stage === "customer"
+    ? p.hs_lifecyclestage_customer_date
+    : p.hs_lifecyclestage_opportunity_date;
+  return raw ? new Date(raw) : null;
+}
+
 async function hubspotPost(url, token, payload) {
   const response = await fetch(url, {
     method: "POST",
@@ -436,6 +434,16 @@ function hashEmail(email) {
   return crypto
     .createHash("sha256")
     .update(email.toLowerCase().trim())
+    .digest("hex");
+}
+
+function hashPhone(phone) {
+  // Normalise to E.164 format before hashing: strip all non-digit characters
+  // except a leading +, then hash. Google requires E.164 (e.g. +254712345678).
+  const normalised = phone.trim().replace(/(?!^\+)[^\d]/g, "");
+  return crypto
+    .createHash("sha256")
+    .update(normalised)
     .digest("hex");
 }
 

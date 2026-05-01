@@ -13,16 +13,24 @@
 
 var CONFIG = {
   RAW_SHEET_NAME: "RAW_HUBSPOT",
+
+  // How far back to fetch contacts from HubSpot (by lastmodifieddate).
+  // Cast a wide net — stage dates are not server-side filterable.
   LOOKBACK_DAYS: 90,
+
+  // Set to true for a one-off full historical pull.
   BACKFILL_MODE: false,
 
   HUBSPOT_API_BASE: "https://api.hubapi.com",
 
   CONTACT_PROPERTIES: [
     "email",
+    "phone",
     "hs_google_click_id",
     "lifecyclestage",
     "createdate",
+    "hs_lifecyclestage_opportunity_date",
+    "hs_lifecyclestage_customer_date",
     "total_revenue"
   ]
 };
@@ -41,14 +49,14 @@ function populateRawHubspot() {
   if (CONFIG.BACKFILL_MODE) {
     Logger.log("BACKFILL_MODE enabled — fetching all opportunity and customer contacts.");
   } else {
-    Logger.log("Cutoff date: " + new Date(cutoffMs).toISOString());
+    Logger.log("Fetch cutoff (lastmodifieddate): " + new Date(cutoffMs).toISOString());
   }
 
   var opportunities = searchContacts(token, "opportunity", cutoffMs);
-  Logger.log("Opportunities found: " + opportunities.length);
+  Logger.log("Opportunities: " + opportunities.length);
 
   var confirmed = searchContacts(token, "customer", cutoffMs);
-  Logger.log("Confirmed found: " + confirmed.length);
+  Logger.log("Confirmed: " + confirmed.length);
 
   var allContacts = opportunities.concat(confirmed);
   Logger.log("Total contacts to write: " + allContacts.length);
@@ -65,7 +73,6 @@ function populateRawHubspot() {
 function searchContacts(token, stage, cutoffMs) {
   var allContacts = [];
   var after = 0;
-  var hasMore = true;
 
   var filters = [{
     propertyName: "lifecyclestage",
@@ -81,7 +88,7 @@ function searchContacts(token, stage, cutoffMs) {
     });
   }
 
-  while (hasMore) {
+  while (true) {
     var payload = {
       filterGroups: [{ filters: filters }],
       properties: CONFIG.CONTACT_PROPERTIES,
@@ -105,7 +112,7 @@ function searchContacts(token, stage, cutoffMs) {
     if (response.paging && response.paging.next && response.paging.next.after) {
       after = response.paging.next.after;
     } else {
-      hasMore = false;
+      break;
     }
   }
 
@@ -115,6 +122,8 @@ function searchContacts(token, stage, cutoffMs) {
 
 // ============================================================
 // WRITE TO RAW_HUBSPOT TAB
+// Full set of fetched contacts — used for auditing.
+// Stage date is stored in place of createdate.
 // ============================================================
 function writeRawData(contacts) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -128,31 +137,35 @@ function writeRawData(contacts) {
   sheet.clearContents();
 
   var headers = [
-    "Contact ID",                      // 0
-    "Email",                           // 1
-    "GCLID",                           // 2
-    "Lifecycle Stage",                 // 3
-    "Contact Create Date (Raw)",       // 4
-    "Contact Create Date (Formatted)", // 5
-    "Total Revenue"                    // 6
+    "Contact ID",             // 0
+    "Email",                  // 1
+    "Phone",                  // 2
+    "GCLID",                  // 3
+    "Lifecycle Stage",        // 4
+    "Contact Create Date",    // 5
+    "Stage Date (Raw)",       // 6
+    "Stage Date (Formatted)", // 7
+    "Total Revenue"           // 8
   ];
 
   var rows = [headers];
 
   for (var i = 0; i < contacts.length; i++) {
     var p = contacts[i].properties;
-    var createDate = p.createdate ? new Date(p.createdate) : null;
-    var createFormatted = createDate
-      ? Utilities.formatDate(createDate, "UTC", "yyyy-MM-dd HH:mm:ss") + "+00:00"
+    var stageDate = getStageDateForContact(contacts[i]);
+    var stageDateFormatted = stageDate
+      ? Utilities.formatDate(stageDate, "UTC", "yyyy-MM-dd HH:mm:ss") + "+00:00"
       : "";
 
     rows.push([
       contacts[i].id,
       p.email || "",
+      p.phone || "",
       p.hs_google_click_id || "",
       p.lifecyclestage || "",
       p.createdate || "",
-      createFormatted,
+      stageDate ? stageDate.toISOString() : "",
+      stageDateFormatted,
       p.total_revenue || ""
     ]);
   }
@@ -165,8 +178,17 @@ function writeRawData(contacts) {
 
 
 // ============================================================
-// HTTP POST HELPER
+// HELPERS
 // ============================================================
+function getStageDateForContact(contact) {
+  var p = contact.properties;
+  var stage = (p.lifecyclestage || "").toLowerCase();
+  var raw = stage === "customer"
+    ? p.hs_lifecyclestage_customer_date
+    : p.hs_lifecyclestage_opportunity_date;
+  return raw ? new Date(raw) : null;
+}
+
 function hubspotPost(url, token, payload) {
   var options = {
     method: "post",
@@ -189,10 +211,6 @@ function hubspotPost(url, token, payload) {
   return JSON.parse(response.getContentText());
 }
 
-
-// ============================================================
-// GET API TOKEN FROM SCRIPT PROPERTIES
-// ============================================================
 function getApiToken() {
   var token = PropertiesService.getScriptProperties().getProperty("HUBSPOT_API_KEY");
   if (!token) {
