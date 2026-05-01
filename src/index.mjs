@@ -126,10 +126,8 @@ async function fetchContacts() {
     console.log(`Fetch cutoff (lastmodifieddate): ${new Date(cutoffMs).toISOString()}`);
   }
 
-  const [opportunities, confirmed] = await Promise.all([
-    searchContacts(token, "opportunity", cutoffMs),
-    searchContacts(token, "customer", cutoffMs)
-  ]);
+  const opportunities = await searchContacts(token, "opportunity", cutoffMs);
+  const confirmed = await searchContacts(token, "customer", cutoffMs);
 
   console.log(`Opportunities: ${opportunities.length} | Confirmed: ${confirmed.length}`);
   return [...opportunities, ...confirmed];
@@ -170,6 +168,7 @@ async function searchContacts(token, stage, cutoffMs) {
 
     if (response.paging?.next?.after) {
       after = response.paging.next.after;
+      await sleep(300); // Stay well within HubSpot's 4 req/sec search limit
     } else {
       break;
     }
@@ -403,6 +402,10 @@ async function sendErrorAlert(errors, startTime) {
 // ============================================================
 // HELPERS
 // ============================================================
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function getStageDateForContact(contact) {
   const p = contact.properties;
   const stage = (p.lifecyclestage || "").toLowerCase();
@@ -412,22 +415,33 @@ function getStageDateForContact(contact) {
   return raw ? new Date(raw) : null;
 }
 
-async function hubspotPost(url, token, payload) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
+async function hubspotPost(url, token, payload, retries = 4) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HubSpot API error ${response.status}: ${text}`);
+    if (response.status === 429) {
+      const retryAfterMs = parseInt(response.headers.get("Retry-After") || "0", 10) * 1000;
+      const backoffMs = retryAfterMs || Math.min(1000 * 2 ** (attempt - 1), 16000);
+      console.warn(`Rate limited by HubSpot. Attempt ${attempt}/${retries}. Waiting ${backoffMs}ms...`);
+      if (attempt === retries) throw new Error("HubSpot rate limit exceeded after max retries.");
+      await sleep(backoffMs);
+      continue;
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`HubSpot API error ${response.status}: ${text}`);
+    }
+
+    return response.json();
   }
-
-  return response.json();
 }
 
 function hashEmail(email) {
