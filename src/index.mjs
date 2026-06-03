@@ -467,7 +467,11 @@ async function hubspotPost(url, token, payload, retries = 4) {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; HubSpot-Integration/1.0; +https://github.com/hnewellwise/hs-googleads-otc)",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache"
       },
       body: JSON.stringify(payload)
     });
