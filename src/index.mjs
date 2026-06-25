@@ -336,6 +336,19 @@ async function writeExecutionLog(sheetsClient, startTime, status, rawRows, uploa
 // ============================================================
 // GOOGLE SHEETS CLIENT
 // ============================================================
+async function withRetry(fn, label, retries = 4) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt === retries) throw e;
+      const backoffMs = Math.min(1000 * 2 ** (attempt - 1), 16000);
+      console.warn(`${label} failed (attempt ${attempt}/${retries}): ${e.message}. Retrying in ${backoffMs}ms...`);
+      await sleep(backoffMs);
+    }
+  }
+}
+
 async function getSheetsClient() {
   const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!serviceAccountJson) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON not set.");
@@ -344,6 +357,9 @@ async function getSheetsClient() {
     credentials: JSON.parse(serviceAccountJson),
     scopes: ["https://www.googleapis.com/auth/spreadsheets"]
   });
+
+  // Force eager token fetch with retries — avoids "Premature close" on first lazy auth
+  await withRetry(() => auth.getAccessToken(), "Google OAuth token fetch");
 
   return google.sheets({ version: "v4", auth });
 }
